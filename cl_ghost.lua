@@ -11,6 +11,51 @@ local speed_lr = 8.0
 local speed_ud = 8.0
 local fov = (fov_max+fov_min)*0.5
 local cameraProp, PRIEST_PED, pedZone
+local areaBlips = {}
+local huntActive = false
+local completedGhosts = {}
+
+local function createAreaBlip(coords)
+    local offsetSign = math.random(-100, 100)/100
+    blip = AddBlipForRadius(coords.x, coords.y, coords.z, 100.0)
+    SetBlipHighDetail(blip, true)
+    SetBlipAlpha(blip, 150)
+    SetBlipColour(blip, 0)
+    return blip
+end
+
+local function createHuntBlips()
+    if not huntActive then return end
+
+    for id, data in pairs(cachedLocations) do
+        if not completedGhosts[joaat(data.model)] then
+            areaBlips[id] = createAreaBlip(data.coords)
+        end
+    end
+end
+
+local function removeGhostBlip(model)
+    for id, data in pairs(cachedLocations) do
+        if joaat(data.model) == model and areaBlips[id] then
+            RemoveBlip(areaBlips[id])
+            areaBlips[id] = nil
+            break
+        end
+    end
+end
+
+local function targetLocalEntity(entity, options, distance)
+    if GetResourceState('ox_target') == 'started' then
+        for _, option in ipairs(options) do
+            option.distance = distance
+            option.onSelect = option.action
+            option.action = nil
+        end
+        exports.ox_target:addLocalEntity(entity, options)
+    else
+        exports['qb-target']:AddTargetEntity(entity, { options = options, distance = distance })
+    end
+end
 
 local function spawnPriest()
     if DoesEntityExist(PRIEST_PED) then return end
@@ -25,23 +70,28 @@ local function spawnPriest()
     FreezeEntityPosition(PRIEST_PED, true)
     SetModelAsNoLongerNeeded(model)
 
-    exports['qb-target']:AddTargetEntity(PRIEST_PED, {
-        options = {
-            {
-                icon = 'fa-solid fa-ghost',
-                label = 'Start Hunting',
-                action = function()
-                    lib.callback.await('randol_ghosts:server:startHunt', false)
-                end,
-            },
+    targetLocalEntity(PRIEST_PED, {
+        {
+            icon = 'fa-solid fa-ghost',
+            label = 'Start Hunting',
+            action = function()
+                local success = lib.callback.await('randol_ghosts:server:startHunt', false)
+                if success then
+                    huntActive = true
+                    createHuntBlips()
+                end
+            end,
         },
-        distance = 1.3
-    })
+    }, 1.5)
 end
 
 local function yeetPriest()
     if not DoesEntityExist(PRIEST_PED) then return end
-    exports['qb-target']:RemoveTargetEntity(PRIEST_PED, 'Start Hunting')
+    if GetResourceState('ox_target') == 'started' then
+        exports.ox_target:removeLocalEntity(PRIEST_PED, 'Start Hunting')
+    else
+        exports['qb-target']:RemoveTargetEntity(PRIEST_PED, 'Start Hunting')
+    end
     DeleteEntity(PRIEST_PED)
     PRIEST_PED = nil
 end
@@ -193,7 +243,14 @@ local function initCamera()
                 CallScaleformMethod(scaleform, "CLOSE_SHUTTER", 100)
                 if closestGhost and IsEntityOnScreen(closestGhost) then
                     SetTimeout(500, function()
-                        local success, num, amount = lib.callback.await('randol_ghosts:server:ghostCaught', false, GetEntityModel(closestGhost))
+                        local model = GetEntityModel(closestGhost)
+                        local success, num, amount = lib.callback.await('randol_ghosts:server:ghostCaught', false, model)
+
+                        if success then
+                            completedGhosts[model] = true
+                            removeGhostBlip(model)
+                        end
+
                         if num and amount then
                             completedMessage(num, amount)
                         end
@@ -237,8 +294,14 @@ function cleanup()
             ghosts[k] = nil
         end
     end
+    for _, blip in pairs(areaBlips) do
+        RemoveBlip(blip)
+    end
     if pedZone then pedZone:remove() pedZone = nil end
     yeetPriest()
+    huntActive = false
+    table.wipe(completedGhosts)
+    table.wipe(areaBlips)
     table.wipe(cachedLocations)
     table.wipe(storedPoints)
 end
@@ -289,7 +352,7 @@ end
 
 local function createGhostSpawns()
     for id, data in pairs(cachedLocations) do
-        local zone = lib.points.new({
+        storedPoints[#storedPoints+1] = lib.points.new({
             coords = data.coords,
             distance = 50,
             index = id,
@@ -297,20 +360,21 @@ local function createGhostSpawns()
             nearby = nearGhost,
             onExit = yeetGhost,
         })
-        storedPoints[#storedPoints+1] = zone
     end
-    pedZone = lib.points.new({
-        coords = vec3(-1681.11, -291.01, 50.88),
-        distance = 50,
-        onEnter = spawnPriest,
-        onExit = yeetPriest,
-    })
+    pedZone = lib.points.new({ coords = vec3(-1681.11, -291.01, 50.88), distance = 50, onEnter = spawnPriest, onExit = yeetPriest, })
 end
 
-RegisterNetEvent('randol_ghosts:client:cacheLocations', function(data)
+RegisterNetEvent('randol_ghosts:client:cacheLocations', function(data, state)
     if GetInvokingResource() or not hasPlyLoaded() then return end
+
     cachedLocations = data
     createGhostSpawns()
+
+    if state then
+        huntActive = true
+        completedGhosts = state.completedGhosts or {}
+        createHuntBlips()
+    end
 end)
 
 AddEventHandler('onResourceStop', function(res)
